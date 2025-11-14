@@ -13,6 +13,7 @@ from numpy import str_ as numpy_str
 from PIL import Image
 from tqdm import tqdm
 
+from simpletuner.gh200 import gh200_uvm_enabled, prefer_cpu_residency, prefetch_to_device
 from simpletuner.helpers.data_backend.base import BaseDataBackend
 from simpletuner.helpers.data_backend.dataset_types import DatasetType, ensure_dataset_type
 from simpletuner.helpers.image_manipulation.batched_training_samples import BatchedTrainingSamples
@@ -33,6 +34,23 @@ if should_log():
     logger.setLevel(os.environ.get("SIMPLETUNER_LOG_LEVEL", "INFO"))
 else:
     logger.setLevel("ERROR")
+
+
+def _prepare_uvm_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if not torch.is_tensor(tensor):
+        return tensor
+
+    if gh200_uvm_enabled() and torch.cuda.is_available():
+        try:
+            tensor = tensor.to(
+                device=torch.device("cuda", torch.cuda.current_device()),
+                non_blocking=True,
+            )
+            prefer_cpu_residency(tensor)
+            return tensor
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.debug("Failed to place tensor in GH200 UVM pool: %s", exc)
+    return tensor.to("cpu")
 
 
 def prepare_sample(
@@ -223,9 +241,9 @@ class VAECache(WebhookMixin):
         try:
             torch_data = self.cache_data_backend.torch_load(filename)
             if isinstance(torch_data, torch.Tensor):
-                torch_data = torch_data.to("cpu")
-            elif isinstance(torch_data, dict):
-                torch_data["latents"] = torch_data["latents"].to("cpu")
+                torch_data = _prepare_uvm_tensor(torch_data)
+            elif isinstance(torch_data, dict) and "latents" in torch_data:
+                torch_data["latents"] = _prepare_uvm_tensor(torch_data["latents"])
 
             return torch_data
         except Exception as e:
@@ -568,6 +586,12 @@ class VAECache(WebhookMixin):
                 for filename in full_filenames
                 if filename not in uncached_images
             ]
+            if gh200_uvm_enabled() and torch.cuda.is_available():
+                for cached_latent in latents:
+                    if torch.is_tensor(cached_latent):
+                        prefetch_to_device(cached_latent)
+                    elif isinstance(cached_latent, dict) and torch.is_tensor(cached_latent.get("latents")):
+                        prefetch_to_device(cached_latent["latents"])
 
         if len(uncached_images) > 0 and (len(images) != len(latents) or len(filepaths) != len(latents)):
             with torch.no_grad():
@@ -661,10 +685,15 @@ class VAECache(WebhookMixin):
             filepaths.append(output_file)
             # pytorch will hold onto all of the tensors in the list if we do not use clone()
             if isinstance(latent_vector, dict):
-                latent_vector["latents"] = latent_vector["latents"].clone()
-                latents.append(latent_vector)
+                cloned_latent = latent_vector["latents"].clone()
+                cloned_latent = _prepare_uvm_tensor(cloned_latent)
+                cloned_entry = dict(latent_vector)
+                cloned_entry["latents"] = cloned_latent
+                latents.append(cloned_entry)
             else:
-                latents.append(latent_vector.clone())
+                cloned_latent = latent_vector.clone()
+                cloned_latent = _prepare_uvm_tensor(cloned_latent)
+                latents.append(cloned_latent)
 
         self.cache_data_backend.write_batch(filepaths, latents)
 

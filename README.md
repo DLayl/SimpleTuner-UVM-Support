@@ -25,6 +25,10 @@ If you have any questions, please feel free to reach out to us there.
 - [Setup](#setup)
 - [Troubleshooting](#troubleshooting)
 
+## GH200 Notes
+
+- **Audio UVM Hints:** Audio batches currently run without GH200 placement hints. When ready to enable them, run `scripts/integrate_audio_support.sh` (after answering “y” during `verify_assumptions.sh`) to merge `simpletuner/gh200/audio_support_snippet.py` into `uvm.py`.
+
 ## Design Philosophy
 
 - **Simplicity**: Aiming to have good default settings for most use cases, so less tinkering is required.
@@ -170,3 +174,20 @@ Enable debug logs for a more detailed insight by adding `export SIMPLETUNER_LOG_
 For performance analysis of the training loop, setting `SIMPLETUNER_TRAINING_LOOP_LOG_LEVEL=DEBUG` will have timestamps that highlight any issues in your configuration.
 
 For a comprehensive list of options available, consult [this documentation](/documentation/OPTIONS.md).
+
+## GH200 Testing
+
+The GH200 optimizations include a comprehensive validation suite:
+
+```bash
+# Run all validation tests (recommended)
+./scripts/run_all_tests.sh
+
+# Or run individual test suites
+./scripts/test_upstream_features.sh  # Upstream feature verification
+./scripts/test_gh200_features.sh     # GH200-specific validation
+./scripts/test_combined_features.sh  # Integration testing
+```
+
+For detailed validation steps and expected outputs, see `GH200_REBASE_CHECKLIST.md`.
+For module-level documentation, see `simpletuner/gh200/README.md`.

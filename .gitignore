@@ -78,3 +78,10 @@ test-folder/
 node_modules
 package-lock.json
 **/config
+
+# GH200 rebase artifacts
+MERGE_LOG.txt
+gh200_diagnostic_report.json
+PATCH_MANIFEST.md
+VERIFICATION_REPORT.txt
+patches/*.patch

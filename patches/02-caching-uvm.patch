@@ -1,0 +1,157 @@
+diff --git a/simpletuner/helpers/caching/text_embeds.py b/simpletuner/helpers/caching/text_embeds.py
+index 25b94c31..c44db212 100644
+--- a/simpletuner/helpers/caching/text_embeds.py
++++ b/simpletuner/helpers/caching/text_embeds.py
+@@ -11,6 +11,7 @@ from threading import Thread
+ import torch
+ from tqdm import tqdm
+ 
++from simpletuner.gh200 import gh200_uvm_enabled, prefer_gpu_residency, prefetch_to_device
+ from simpletuner.helpers.data_backend.base import BaseDataBackend
+ from simpletuner.helpers.models.common import ModelFoundation
+ from simpletuner.helpers.prompts import PromptHandler
+@@ -29,6 +30,31 @@ else:
+     logger.setLevel("ERROR")
+ 
+ 
++def _prepare_text_embed_tensor(tensor: torch.Tensor) -> torch.Tensor:
++    if not torch.is_tensor(tensor):
++        return tensor
++
++    if gh200_uvm_enabled() and torch.cuda.is_available():
++        try:
++            tensor = tensor.to(
++                device=torch.device("cuda", torch.cuda.current_device()),
++                non_blocking=True,
++            )
++            prefer_gpu_residency(tensor)
++            return tensor
++        except Exception as exc:  # pragma: no cover - best effort
++            logger.debug("Failed to place text embedding in GH200 pool: %s", exc)
++    return tensor.to("cpu")
++
++
++def _apply_gpu_hint_to_dict(tensor_dict: dict) -> dict:
++    if not (gh200_uvm_enabled() and torch.cuda.is_available()):
++        return tensor_dict
++    for value in tensor_dict.values():
++        if torch.is_tensor(value):
++            prefer_gpu_residency(value)
++    return tensor_dict
++
+ class TextEmbeddingCache(WebhookMixin):
+     prompts = {}
+ 
+@@ -197,6 +223,12 @@ class TextEmbeddingCache(WebhookMixin):
+ 
+     def load_from_cache(self, filename):
+         result = self.data_backend.torch_load(filename)
++        if isinstance(result, dict):
++            for key, value in result.items():
++                if torch.is_tensor(value):
++                    result[key] = _prepare_text_embed_tensor(value)
++        elif torch.is_tensor(result):
++            result = _prepare_text_embed_tensor(result)
+         return result
+ 
+     def encode_wan_prompt(
+@@ -379,6 +411,10 @@ class TextEmbeddingCache(WebhookMixin):
+                         logger.debug(
+                             f"Filename {filename} prompt embeds: {embed_shapes}, keys: {text_encoder_output.keys()}"
+                         )
++                        if gh200_uvm_enabled() and torch.cuda.is_available():
++                            for tensor in text_encoder_output.values():
++                                if torch.is_tensor(tensor):
++                                    prefetch_to_device(tensor)
+                     except Exception as e:
+                         # We failed to load. Now encode the prompt.
+                         logger.error(
+@@ -430,6 +466,7 @@ class TextEmbeddingCache(WebhookMixin):
+                         text_encoder_output = move_dict_of_tensors_to_device(
+                             tensors=text_encoder_output, device=self.accelerator.device
+                         )
++                        text_encoder_output = _apply_gpu_hint_to_dict(text_encoder_output)
+                     else:
+                         # if we're not returning them, we'll just nuke them
+                         text_encoder_output = move_dict_of_tensors_to_device(tensors=text_encoder_output, device="meta")
+diff --git a/simpletuner/helpers/caching/vae.py b/simpletuner/helpers/caching/vae.py
+index 3df1344e..2b4932a2 100644
+--- a/simpletuner/helpers/caching/vae.py
++++ b/simpletuner/helpers/caching/vae.py
+@@ -13,6 +13,7 @@ from numpy import str_ as numpy_str
+ from PIL import Image
+ from tqdm import tqdm
+ 
++from simpletuner.gh200 import gh200_uvm_enabled, prefer_cpu_residency, prefetch_to_device
+ from simpletuner.helpers.data_backend.base import BaseDataBackend
+ from simpletuner.helpers.image_manipulation.batched_training_samples import BatchedTrainingSamples
+ from simpletuner.helpers.image_manipulation.training_sample import PreparedSample, TrainingSample
+@@ -34,6 +35,23 @@ else:
+     logger.setLevel("ERROR")
+ 
+ 
++def _prepare_uvm_tensor(tensor: torch.Tensor) -> torch.Tensor:
++    if not torch.is_tensor(tensor):
++        return tensor
++
++    if gh200_uvm_enabled() and torch.cuda.is_available():
++        try:
++            tensor = tensor.to(
++                device=torch.device("cuda", torch.cuda.current_device()),
++                non_blocking=True,
++            )
++            prefer_cpu_residency(tensor)
++            return tensor
++        except Exception as exc:  # pragma: no cover - best effort
++            logger.debug("Failed to place tensor in GH200 UVM pool: %s", exc)
++    return tensor.to("cpu")
++
++
+ def prepare_sample(
+     image: Image.Image = None,
+     data_backend_id: str = None,
+@@ -221,9 +239,9 @@ class VAECache(WebhookMixin):
+         try:
+             torch_data = self.cache_data_backend.torch_load(filename)
+             if isinstance(torch_data, torch.Tensor):
+-                torch_data = torch_data.to("cpu")
+-            elif isinstance(torch_data, dict):
+-                torch_data["latents"] = torch_data["latents"].to("cpu")
++                torch_data = _prepare_uvm_tensor(torch_data)
++            elif isinstance(torch_data, dict) and "latents" in torch_data:
++                torch_data["latents"] = _prepare_uvm_tensor(torch_data["latents"])
+ 
+             return torch_data
+         except Exception as e:
+@@ -563,6 +581,12 @@ class VAECache(WebhookMixin):
+                 for filename in full_filenames
+                 if filename not in uncached_images
+             ]
++            if gh200_uvm_enabled() and torch.cuda.is_available():
++                for cached_latent in latents:
++                    if torch.is_tensor(cached_latent):
++                        prefetch_to_device(cached_latent)
++                    elif isinstance(cached_latent, dict) and torch.is_tensor(cached_latent.get("latents")):
++                        prefetch_to_device(cached_latent["latents"])
+ 
+         if len(uncached_images) > 0 and (len(images) != len(latents) or len(filepaths) != len(latents)):
+             with torch.no_grad():
+@@ -656,10 +680,15 @@ class VAECache(WebhookMixin):
+             filepaths.append(output_file)
+             # pytorch will hold onto all of the tensors in the list if we do not use clone()
+             if isinstance(latent_vector, dict):
+-                latent_vector["latents"] = latent_vector["latents"].clone()
+-                latents.append(latent_vector)
++                cloned_latent = latent_vector["latents"].clone()
++                cloned_latent = _prepare_uvm_tensor(cloned_latent)
++                cloned_entry = dict(latent_vector)
++                cloned_entry["latents"] = cloned_latent
++                latents.append(cloned_entry)
+             else:
+-                latents.append(latent_vector.clone())
++                cloned_latent = latent_vector.clone()
++                cloned_latent = _prepare_uvm_tensor(cloned_latent)
++                latents.append(cloned_latent)
+ 
+         self.cache_data_backend.write_batch(filepaths, latents)
+ 

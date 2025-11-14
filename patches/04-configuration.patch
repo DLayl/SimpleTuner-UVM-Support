@@ -1,0 +1,33 @@
+diff --git a/simpletuner/helpers/configuration/json_file.py b/simpletuner/helpers/configuration/json_file.py
+index b0c05fb9..5f18716e 100644
+--- a/simpletuner/helpers/configuration/json_file.py
++++ b/simpletuner/helpers/configuration/json_file.py
+@@ -4,6 +4,7 @@ import os
+ from pathlib import Path
+ 
+ from simpletuner.helpers.configuration.cli_utils import mapping_to_cli_args
++from simpletuner.helpers.training.state_tracker import StateTracker
+ from simpletuner.helpers.training.multi_process import should_log
+ 
+ logger = logging.getLogger("SimpleTuner")
+@@ -76,6 +77,7 @@ def load_json_config():
+         try:
+             config = json.load(file)
+             logger.info(f"[CONFIG.JSON] Loaded configuration from {config_json_path}")
++            StateTracker.set_raw_config(config)
+ 
+             def _transform(key: str, value: object) -> object:
+                 if isinstance(value, str):
+diff --git a/simpletuner/helpers/configuration/loader.py b/simpletuner/helpers/configuration/loader.py
+index db251ecf..ddf8c987 100644
+--- a/simpletuner/helpers/configuration/loader.py
++++ b/simpletuner/helpers/configuration/loader.py
+@@ -90,6 +90,8 @@ def load_config(args: dict = None, exit_on_error: bool = False):
+     if "-h" in sys.argv or "--help" in sys.argv:
+         return helpers["cmd"]()
+ 
++    if isinstance(args, dict) and args:
++        StateTracker.set_raw_config(args)
+     if args is not None and hasattr(args, "__dict__"):
+         args = args.__dict__.copy()
+         args.pop("should_abort", None)

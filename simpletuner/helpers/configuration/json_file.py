@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 from simpletuner.helpers.configuration.cli_utils import mapping_to_cli_args
+from simpletuner.helpers.training.state_tracker import StateTracker
 from simpletuner.helpers.training.multi_process import should_log
 
 logger = logging.getLogger("SimpleTuner")
@@ -84,6 +85,7 @@ def load_json_config():
         try:
             config = json.load(file)
             logger.info(f"[CONFIG.JSON] Loaded configuration from {config_json_path}")
+            StateTracker.set_raw_config(config)
 
             def _transform(key: str, value: object) -> object:
                 if isinstance(value, str):

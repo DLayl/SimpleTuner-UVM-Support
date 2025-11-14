@@ -11,6 +11,7 @@ from threading import Thread
 import torch
 from tqdm import tqdm
 
+from simpletuner.gh200 import gh200_uvm_enabled, prefer_gpu_residency, prefetch_to_device
 from simpletuner.helpers.data_backend.base import BaseDataBackend
 from simpletuner.helpers.models.common import ModelFoundation
 from simpletuner.helpers.prompts import PromptHandler
@@ -28,6 +29,31 @@ if should_log():
 else:
     logger.setLevel("ERROR")
 
+
+def _prepare_text_embed_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if not torch.is_tensor(tensor):
+        return tensor
+
+    if gh200_uvm_enabled() and torch.cuda.is_available():
+        try:
+            tensor = tensor.to(
+                device=torch.device("cuda", torch.cuda.current_device()),
+                non_blocking=True,
+            )
+            prefer_gpu_residency(tensor)
+            return tensor
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.debug("Failed to place text embedding in GH200 pool: %s", exc)
+    return tensor.to("cpu")
+
+
+def _apply_gpu_hint_to_dict(tensor_dict: dict) -> dict:
+    if not (gh200_uvm_enabled() and torch.cuda.is_available()):
+        return tensor_dict
+    for value in tensor_dict.values():
+        if torch.is_tensor(value):
+            prefer_gpu_residency(value)
+    return tensor_dict
 
 class TextEmbeddingCache(WebhookMixin):
     prompts = {}
@@ -197,6 +223,12 @@ class TextEmbeddingCache(WebhookMixin):
 
     def load_from_cache(self, filename):
         result = self.data_backend.torch_load(filename)
+        if isinstance(result, dict):
+            for key, value in result.items():
+                if torch.is_tensor(value):
+                    result[key] = _prepare_text_embed_tensor(value)
+        elif torch.is_tensor(result):
+            result = _prepare_text_embed_tensor(result)
         return result
 
     def encode_wan_prompt(
@@ -379,6 +411,10 @@ class TextEmbeddingCache(WebhookMixin):
                         logger.debug(
                             f"Filename {filename} prompt embeds: {embed_shapes}, keys: {text_encoder_output.keys()}"
                         )
+                        if gh200_uvm_enabled() and torch.cuda.is_available():
+                            for tensor in text_encoder_output.values():
+                                if torch.is_tensor(tensor):
+                                    prefetch_to_device(tensor)
                     except Exception as e:
                         # We failed to load. Now encode the prompt.
                         logger.error(
@@ -430,6 +466,7 @@ class TextEmbeddingCache(WebhookMixin):
                         text_encoder_output = move_dict_of_tensors_to_device(
                             tensors=text_encoder_output, device=self.accelerator.device
                         )
+                        text_encoder_output = _apply_gpu_hint_to_dict(text_encoder_output)
                     else:
                         # if we're not returning them, we'll just nuke them
                         text_encoder_output = move_dict_of_tensors_to_device(tensors=text_encoder_output, device="meta")

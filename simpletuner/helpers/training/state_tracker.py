@@ -65,6 +65,8 @@ class StateTracker:
     aspect_resolution_map = {}
     distillation_method: Optional[str] = None
     distiller_profile: DistillerRequirementProfile = EMPTY_PROFILE
+    raw_config = {}
+    gh200_runtime_config = {}
 
     # for schedulefree
     last_lr = 0.0
@@ -148,6 +150,22 @@ class StateTracker:
     @classmethod
     def get_config_path(cls):
         return cls.config_path
+
+    @classmethod
+    def set_raw_config(cls, config: Optional[dict]):
+        cls.raw_config = config or {}
+
+    @classmethod
+    def get_raw_config(cls) -> dict:
+        return cls.raw_config
+
+    @classmethod
+    def set_gh200_runtime_config(cls, config: Optional[dict]):
+        cls.gh200_runtime_config = config or {}
+
+    @classmethod
+    def get_gh200_runtime_config(cls) -> dict:
+        return cls.gh200_runtime_config
 
     @classmethod
     def set_model_family(cls, model_type: str):

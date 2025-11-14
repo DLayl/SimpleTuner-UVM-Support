@@ -1,0 +1,248 @@
+diff --git a/simpletuner/helpers/training/trainer.py b/simpletuner/helpers/training/trainer.py
+index 19b4c083..c3dd831f 100644
+--- a/simpletuner/helpers/training/trainer.py
++++ b/simpletuner/helpers/training/trainer.py
+@@ -18,8 +18,9 @@ from pathlib import Path
+ from typing import Any, Dict, List, Optional
+ 
+ import huggingface_hub
+-
+ import wandb
++
++from simpletuner.gh200 import gh200_uvm_enabled, optimize_batch_for_gh200, set_uvm_hint_override
+ from simpletuner.helpers import log_format  # noqa
+ from simpletuner.helpers.caching.memory import reclaim_memory
+ from simpletuner.helpers.configuration.cli_utils import mapping_to_cli_args
+@@ -49,7 +50,6 @@ from simpletuner.helpers.training.optimizer_param import (
+     create_optimizer_with_param_groups,
+     determine_optimizer_class_with_config,
+     determine_params_to_optimize,
+-    is_bitsandbytes_available,
+     is_lr_schedulefree,
+     is_lr_scheduler_disabled,
+ )
+@@ -160,6 +160,53 @@ SCHEDULER_NAME_MAP = {
+     "ddim": DDIMScheduler,
+     "ddpm": DDPMScheduler,
+ }
++
++
++class GH200GradientRamp:
++    def __init__(
++        self,
++        *,
++        train_batch_size: int,
++        base_ga: int,
++        initial_effective: Optional[int] = None,
++        target_effective: Optional[int] = None,
++        total_steps: int = 0,
++    ) -> None:
++        self.train_batch_size = max(1, int(train_batch_size))
++        base_ga = max(1, int(base_ga))
++
++        if initial_effective is None:
++            initial_effective = self.train_batch_size * base_ga
++        if target_effective is None:
++            target_effective = self.train_batch_size * base_ga
++
++        self.initial_ga = max(1, int(round(initial_effective / self.train_batch_size)))
++        self.target_ga = max(1, int(round(target_effective / self.train_batch_size)))
++        self.total_steps = max(0, int(total_steps))
++        self._micro_step_index = 0
++        self._increasing = self.target_ga >= self.initial_ga
++
++    def advance(self) -> int:
++        value = self._compute_ga(self._micro_step_index)
++        self._micro_step_index += 1
++        return value
++
++    def _compute_ga(self, index: int) -> int:
++        if self.total_steps <= 0 or self.initial_ga == self.target_ga:
++            return self.target_ga
++
++        clamped = min(max(index, 0) / self.total_steps, 1.0)
++        # Use a smooth quadratic progression to avoid abrupt jumps.
++        ga_float = self.initial_ga + (self.target_ga - self.initial_ga) * (clamped ** 2)
++
++        if self._increasing:
++            ga_int = math.ceil(ga_float)
++            ga_int = max(self.initial_ga, min(self.target_ga, ga_int))
++        else:
++            ga_int = math.floor(ga_float)
++            ga_int = min(self.initial_ga, max(self.target_ga, ga_int))
++
++        return max(1, ga_int)
+ logging.basicConfig(
+     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+     datefmt="%m/%d/%Y %H:%M:%S",
+@@ -192,6 +239,8 @@ class Trainer:
+         self.lr_scheduler = None
+         self.webhook_handler = None
+         self.should_abort = False
++        self.gh200_ramp_scheduler = None
++        self._gh200_last_reported_ga = None
+         self._external_abort_checker = None
+         self.ema_model = None
+         self.job_id = job_id
+@@ -223,6 +272,75 @@ class Trainer:
+             return None
+         return type("Config", (object,), config)
+ 
++    def _configure_gh200_runtime(self) -> None:
++        raw_config = StateTracker.get_raw_config() or {}
++        gh200_opts = raw_config.get("gh200_optimizations") or {}
++        cache_opts = raw_config.get("cache_config") or {}
++
++        override_flag = gh200_opts.get("enable_uvm_hints")
++        if override_flag is None:
++            unified_requested = False
++            for key in ("vae_cache_type", "text_cache_type"):
++                value = cache_opts.get(key)
++                if isinstance(value, str) and value.strip().lower() == "unified_memory":
++                    unified_requested = True
++                    break
++            if unified_requested:
++                override_flag = True
++
++        if isinstance(override_flag, bool):
++            set_uvm_hint_override(override_flag)
++        else:
++            set_uvm_hint_override(None)
++
++        runtime_details = {
++            "uvm_hints_enabled": gh200_uvm_enabled(),
++        }
++
++        enable_ramp = gh200_opts.get("enable_batch_size_rampup")
++        ramp_steps = int(gh200_opts.get("batch_rampup_steps", 0) or 0)
++        if enable_ramp and ramp_steps > 0:
++            scheduler = GH200GradientRamp(
++                train_batch_size=self.config.train_batch_size,
++                base_ga=max(1, getattr(self.config, "gradient_accumulation_steps", 1)),
++                initial_effective=gh200_opts.get("initial_effective_batch_size"),
++                target_effective=gh200_opts.get("target_effective_batch_size"),
++                total_steps=ramp_steps,
++            )
++            self.gh200_ramp_scheduler = scheduler
++            self.config.gradient_accumulation_steps = scheduler.initial_ga
++            self._gh200_last_reported_ga = scheduler.initial_ga
++            runtime_details["gradient_accumulation_schedule"] = {
++                "initial_ga": scheduler.initial_ga,
++                "target_ga": scheduler.target_ga,
++                "total_steps": scheduler.total_steps,
++            }
++            logger.info(
++                "GH200 gradient accumulation ramp enabled (initial=%s, target=%s, ramp_steps=%s).",
++                scheduler.initial_ga,
++                scheduler.target_ga,
++                scheduler.total_steps,
++            )
++        else:
++            self.gh200_ramp_scheduler = None
++            self._gh200_last_reported_ga = getattr(self.config, "gradient_accumulation_steps", None)
++
++        StateTracker.set_gh200_runtime_config(runtime_details)
++
++    def _apply_dynamic_gradient_accumulation(self) -> int:
++        if not self.gh200_ramp_scheduler:
++            return self.config.gradient_accumulation_steps
++
++        new_ga = self.gh200_ramp_scheduler.advance()
++        if new_ga != self._gh200_last_reported_ga:
++            logger.debug("GH200 ramp adjusted gradient_accumulation_steps -> %s", new_ga)
++            self._gh200_last_reported_ga = new_ga
++
++        self.config.gradient_accumulation_steps = new_ga
++        if self.accelerator is not None and hasattr(self.accelerator, "gradient_accumulation_steps"):
++            self.accelerator.gradient_accumulation_steps = new_ga
++        return new_ga
++
+     def _update_grad_metrics(
+         self, target_logs: Dict[str, float], *, require_value_method: bool = False, clone_norm_value: bool = False
+     ):
+@@ -239,49 +357,6 @@ class Trainer:
+         ) and not self.config.use_deepspeed_optimizer:
+             target_logs["grad_absmax"] = self.grad_norm
+ 
+-    def _config_uses_bitsandbytes(self) -> bool:
+-        if not getattr(self, "config", None):
+-            return False
+-
+-        def _contains_bnb(value: object) -> bool:
+-            if isinstance(value, str):
+-                return "bnb" in value.lower()
+-            if isinstance(value, dict):
+-                return any(_contains_bnb(item) for item in value.values())
+-            if isinstance(value, (list, tuple, set)):
+-                return any(_contains_bnb(item) for item in value)
+-            return False
+-
+-        for attr_value in vars(self.config).values():
+-            try:
+-                if _contains_bnb(attr_value):
+-                    return True
+-            except Exception:
+-                continue
+-        return False
+-
+-    def _enable_dynamo_dynamic_output_capture(self) -> None:
+-        try:
+-            import torch._dynamo as torch_dynamo
+-        except Exception as exc:
+-            logger.warning("Unable to configure Torch Dynamo dynamic output capture: %s", exc)
+-            return
+-
+-        config_obj = getattr(torch_dynamo, "config", None)
+-        if config_obj is None:
+-            logger.debug("Torch Dynamo config unavailable; skipping dynamic output capture configuration.")
+-            return
+-        if not hasattr(config_obj, "capture_dynamic_output_shape_ops"):
+-            logger.debug(
+-                "Torch Dynamo config lacks capture_dynamic_output_shape_ops; skipping dynamic output capture configuration."
+-            )
+-            return
+-        if getattr(config_obj, "capture_dynamic_output_shape_ops", False):
+-            return
+-
+-        config_obj.capture_dynamic_output_shape_ops = True
+-        logger.info("Torch Dynamo capture_dynamic_output_shape_ops enabled for bitsandbytes models.")
+-
+     def parse_arguments(self, args=None, disable_accelerator: bool = False, exit_on_error: bool = False):
+         skip_config_fallback = False
+         args_payload = args
+@@ -310,6 +385,8 @@ class Trainer:
+         if self.config is None:
+             raise ValueError("Training configuration could not be parsed")
+ 
++        self._configure_gh200_runtime()
++
+         accelerate_config_path = getattr(self.config, "accelerate_config", None)
+         if accelerate_config_path not in (None, "", "None"):
+             os.environ["ACCELERATE_CONFIG_PATH"] = os.path.expanduser(str(accelerate_config_path))
+@@ -446,9 +523,6 @@ class Trainer:
+ 
+             dynamo_plugin = None
+             if resolved_dynamo_backend and resolved_dynamo_backend != DynamoBackend.NO:
+-                if is_bitsandbytes_available and self._config_uses_bitsandbytes():
+-                    self._enable_dynamo_dynamic_output_capture()
+-
+                 plugin_kwargs: Dict[str, object] = {"backend": resolved_dynamo_backend}
+ 
+                 mode_value = getattr(self.config, "dynamo_mode", None)
+@@ -3121,6 +3195,7 @@ class Trainer:
+                 self._exit_on_signal()
+                 step += 1
+                 prepared_batch = self.prepare_batch(iterator_fn(step, *iterator_args))
++                optimize_batch_for_gh200(prepared_batch)
+                 training_logger.debug(f"Iterator: {iterator_fn}")
+                 if self.config.lr_scheduler == "cosine_with_restarts":
+                     self.extra_lr_scheduler_kwargs["step"] = self.state["global_step"]
+@@ -3154,6 +3229,8 @@ class Trainer:
+ 
+                 if getattr(self, "distiller", None) is not None:
+                     self.distiller.pre_training_step(self.model, step)
++                if self.gh200_ramp_scheduler:
++                    self._apply_dynamic_gradient_accumulation()
+                 with self.accelerator.accumulate(training_models):
+                     bsz = prepared_batch["latents"].shape[0]
+                     training_logger.debug("Sending latent batch to GPU.")

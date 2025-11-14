@@ -1,0 +1,305 @@
+diff --git a/simpletuner/helpers/data_backend/builders/__init__.py b/simpletuner/helpers/data_backend/builders/__init__.py
+index 90ab6982..1377c53b 100644
+--- a/simpletuner/helpers/data_backend/builders/__init__.py
++++ b/simpletuner/helpers/data_backend/builders/__init__.py
+@@ -6,6 +6,7 @@ from .aws import AwsBackendBuilder
+ from .base import BaseBackendBuilder
+ from .csv import CsvBackendBuilder
+ from .huggingface import HuggingfaceBackendBuilder
++from .in_memory import InMemoryBackendBuilder
+ from .local import LocalBackendBuilder
+ 
+ __all__ = [
+@@ -14,6 +15,7 @@ __all__ = [
+     "AwsBackendBuilder",
+     "CsvBackendBuilder",
+     "HuggingfaceBackendBuilder",
++    "InMemoryBackendBuilder",
+     "create_backend_builder",
+     "build_backend_from_config",
+ ]
+@@ -25,6 +27,7 @@ def create_backend_builder(backend_type: str, accelerator, args: Optional[Any] =
+         "aws": AwsBackendBuilder,
+         "csv": CsvBackendBuilder,
+         "huggingface": HuggingfaceBackendBuilder,
++        "in_memory": InMemoryBackendBuilder,
+     }
+ 
+     if backend_type not in builder_mapping:
+diff --git a/simpletuner/helpers/data_backend/builders/in_memory.py b/simpletuner/helpers/data_backend/builders/in_memory.py
+new file mode 100644
+index 00000000..0b5ac80d
+--- /dev/null
++++ b/simpletuner/helpers/data_backend/builders/in_memory.py
+@@ -0,0 +1,61 @@
++"""GH200 in-memory backend builder."""
++
++import logging
++from typing import Any, Dict, Optional
++
++from simpletuner.gh200.in_memory_backend import GH200InMemoryBackend
++from simpletuner.helpers.data_backend.config.base import BaseBackendConfig
++
++from .base import BaseBackendBuilder
++
++logger = logging.getLogger("InMemoryBackendBuilder")
++
++
++class InMemoryBackendBuilder(BaseBackendBuilder):
++
++    def _create_backend(self, config: BaseBackendConfig) -> GH200InMemoryBackend:
++        backend_cfg: Dict[str, Any] = config.to_dict()["config"]
++        in_memory_config: Dict[str, Any] = backend_cfg.get("in_memory", {})
++
++        file_extensions = in_memory_config.get("file_extensions")
++        compression = in_memory_config.get("compression")
++        memory_limit = in_memory_config.get("memory_limit_gb")
++        num_workers = in_memory_config.get("num_workers", 32)
++
++        instance_dir = backend_cfg.get("instance_data_dir", config.instance_data_dir)
++        if not instance_dir:
++            raise ValueError(f"(id={config.id}) In-memory backend requires an 'instance_data_dir'.")
++
++        backend = GH200InMemoryBackend(
++            accelerator=self.accelerator,
++            id=config.id,
++            instance_data_dir=instance_dir,
++            file_extensions=file_extensions,
++            compression=compression,
++            memory_limit_gb=memory_limit,
++            num_workers=num_workers,
++        )
++
++        return backend
++
++    def build_with_metadata(
++        self, config: BaseBackendConfig, args: Dict[str, Any], instance_data_dir: Optional[str] = None
++    ) -> Dict[str, Any]:
++        logger.info(f"(id={config.id}) Loading in-memory dataset for GH200 deployment.")
++
++        data_backend = self.build(config)
++
++        metadata_backend = self.create_metadata_backend(
++            config=config,
++            data_backend=data_backend,
++            args=args,
++            instance_data_dir=instance_data_dir or data_backend.get_abs_path(),
++        )
++
++        return {
++            "id": config.id,
++            "data_backend": data_backend,
++            "metadata_backend": metadata_backend,
++            "instance_data_dir": data_backend.get_abs_path(),
++            "config": config.to_dict()["config"],
++        }
+diff --git a/simpletuner/helpers/data_backend/factory.py b/simpletuner/helpers/data_backend/factory.py
+index c8781221..c12fd9e1 100644
+--- a/simpletuner/helpers/data_backend/factory.py
++++ b/simpletuner/helpers/data_backend/factory.py
+@@ -84,6 +84,7 @@ from simpletuner.helpers.data_backend.csv_url_list import CSVDataBackend
+ from simpletuner.helpers.data_backend.dataset_types import DatasetType, ensure_dataset_type
+ from simpletuner.helpers.data_backend.huggingface import HuggingfaceDatasetsBackend
+ from simpletuner.helpers.data_backend.local import LocalDataBackend
++from simpletuner.gh200.in_memory_backend import GH200InMemoryBackend
+ from simpletuner.helpers.distillation.common import DistillationBase
+ from simpletuner.helpers.distillation.requirements import (
+     EMPTY_PROFILE,
+@@ -167,7 +168,7 @@ def _is_primary_training_backend(backend: Dict[str, Any]) -> bool:
+     }
+     raw_type = backend.get("dataset_type")
+     if raw_type is None:
+-        return backend.get("type") in {"local", "aws", "csv", "huggingface"}
++        return backend.get("type") in {"local", "aws", "csv", "huggingface", "in_memory"}
+     try:
+         return ensure_dataset_type(raw_type, default=DatasetType.IMAGE) in primary_types
+     except ValueError:
+@@ -719,6 +720,8 @@ def from_instance_representation(representation: dict) -> "BaseDataBackend":
+         from simpletuner.helpers.data_backend.local import LocalDataBackend
+ 
+         return LocalDataBackend.from_instance_representation(representation)
++    elif backend_type == "in_memory":
++        return GH200InMemoryBackend.from_instance_representation(representation)
+     elif backend_type == "huggingface":
+         from simpletuner.helpers.data_backend.huggingface import HuggingfaceDatasetsBackend
+ 
+@@ -1242,7 +1245,7 @@ class FactoryRegistry:
+             if backend.get("disabled", False) or backend.get("disable", False):
+                 continue
+             backend_type = backend.get("type", "local")
+-            if backend_type not in {"local"}:
++            if backend_type not in {"local", "in_memory"}:
+                 continue
+ 
+             dataset_type = backend.get("dataset_type", None)
+@@ -1328,68 +1331,67 @@ class FactoryRegistry:
+                 f"(id={backend.get('id')}) process_conditioning_datasets: dataset_type={dataset_type}, "
+                 f"keys={list(backend.keys())}"
+             )
++            if dataset_type != "video":
++                continue
+ 
+-            video_config = {}
+-            is_i2v_dataset = False
+-            if dataset_type == "video":
+-                video_config = backend.get("video", {}) or {}
+-                debug_log(
+-                    f"(id={backend.get('id')}) process_conditioning_datasets: video_config_type={type(video_config)}, "
+-                    f"video_config={video_config}"
+-                )
+-                is_i2v_dataset = bool(video_config.get("is_i2v", False))
+-                debug_log(
+-                    f"(id={backend.get('id')}) process_conditioning_datasets: is_i2v_dataset={is_i2v_dataset} "
+-                    f"(raw={video_config.get('is_i2v', None)})"
++            video_config = backend.get("video", {}) or {}
++            debug_log(
++                f"(id={backend.get('id')}) process_conditioning_datasets: video_config_type={type(video_config)}, "
++                f"video_config={video_config}"
++            )
++            is_i2v_dataset = bool(video_config.get("is_i2v", False))
++            debug_log(
++                f"(id={backend.get('id')}) process_conditioning_datasets: is_i2v_dataset={is_i2v_dataset} "
++                f"(raw={video_config.get('is_i2v', None)})"
++            )
++            if is_i2v_dataset:
++                conditioning_spec = backend.get("conditioning")
++                if isinstance(conditioning_spec, list):
++                    conditioning_spec_count = len(conditioning_spec)
++                    conditioning_types = [
++                        entry.get("type", "<unknown>") for entry in conditioning_spec if isinstance(entry, dict)
++                    ]
++                elif isinstance(conditioning_spec, dict):
++                    conditioning_spec_count = 1
++                    conditioning_types = [conditioning_spec.get("type", "<unknown>")]
++                else:
++                    conditioning_spec_count = 0 if conditioning_spec in (None, [], {}) else 1
++                    conditioning_types = []
++                linked_conditioning = backend.get("conditioning_data") or []
++                info_log(
++                    f"(id={backend['id']}) Detected I2V video dataset. "
++                    f"Configured conditioning entries: {conditioning_spec_count} ({conditioning_types if conditioning_types else 'n/a'}); "
++                    f"linked conditioning datasets: {len(linked_conditioning)}; "
++                    f"instance_data_dir={backend.get('instance_data_dir')}"
+                 )
+-                if is_i2v_dataset:
+-                    conditioning_spec = backend.get("conditioning")
+-                    if isinstance(conditioning_spec, list):
+-                        conditioning_spec_count = len(conditioning_spec)
+-                        conditioning_types = [
+-                            entry.get("type", "<unknown>") for entry in conditioning_spec if isinstance(entry, dict)
+-                        ]
+-                    elif isinstance(conditioning_spec, dict):
+-                        conditioning_spec_count = 1
+-                        conditioning_types = [conditioning_spec.get("type", "<unknown>")]
++                if conditioning_spec_count == 0 and len(linked_conditioning) == 0:
++                    virtual_id = f"{backend['id']}_conditioning_i2v"
++                    if any(cfg.get("id") == virtual_id for cfg in data_backend_config):
++                        info_log(
++                            f"(id={backend['id']}) I2V conditioning dataset {virtual_id} already present; skipping regeneration."
++                        )
+                     else:
+-                        conditioning_spec_count = 0 if conditioning_spec in (None, [], {}) else 1
+-                        conditioning_types = []
+-                    linked_conditioning = backend.get("conditioning_data") or []
+-                    info_log(
+-                        f"(id={backend['id']}) Detected I2V video dataset. "
+-                        f"Configured conditioning entries: {conditioning_spec_count} ({conditioning_types if conditioning_types else 'n/a'}); "
+-                        f"linked conditioning datasets: {len(linked_conditioning)}; "
+-                        f"instance_data_dir={backend.get('instance_data_dir')}"
+-                    )
+-                    if conditioning_spec_count == 0 and len(linked_conditioning) == 0:
+-                        virtual_id = f"{backend['id']}_conditioning_i2v"
+-                        if any(cfg.get("id") == virtual_id for cfg in data_backend_config):
+-                            info_log(
+-                                f"(id={backend['id']}) I2V conditioning dataset {virtual_id} already present; skipping regeneration."
+-                            )
++                        info_log(
++                            f"(id={backend['id']}) No explicit conditioning datasets provided; creating virtual I2V conditioning dataset {virtual_id}."
++                        )
++                        virtual_backend = deepcopy(backend)
++                        virtual_backend["id"] = virtual_id
++                        virtual_backend["dataset_type"] = "conditioning"
++                        virtual_backend.pop("conditioning", None)
++                        virtual_backend["conditioning_data"] = []
++                        virtual_backend["conditioning_type"] = "reference_strict"
++                        virtual_backend["source_dataset_id"] = backend["id"]
++                        virtual_backend["auto_generated"] = False
++                        # ensure video stanza exists for downstream size alignment
++                        if isinstance(virtual_backend.get("video"), dict):
++                            virtual_backend["video"] = dict(virtual_backend["video"])
++                            virtual_backend["video"].setdefault("is_i2v", True)
++                        if backend.get("cache_dir_vae"):
++                            virtual_backend["cache_dir_vae"] = os.path.join(backend["cache_dir_vae"], virtual_id)
+                         else:
+-                            info_log(
+-                                f"(id={backend['id']}) No explicit conditioning datasets provided; creating virtual I2V conditioning dataset {virtual_id}."
+-                            )
+-                            virtual_backend = deepcopy(backend)
+-                            virtual_backend["id"] = virtual_id
+-                            virtual_backend["dataset_type"] = "conditioning"
+-                            virtual_backend.pop("conditioning", None)
+-                            virtual_backend["conditioning_data"] = []
+-                            virtual_backend["conditioning_type"] = "reference_strict"
+-                            virtual_backend["source_dataset_id"] = backend["id"]
+-                            virtual_backend["auto_generated"] = False
+-                            # ensure video stanza exists for downstream size alignment
+-                            if isinstance(virtual_backend.get("video"), dict):
+-                                virtual_backend["video"] = dict(virtual_backend["video"])
+-                                virtual_backend["video"].setdefault("is_i2v", True)
+-                            if backend.get("cache_dir_vae"):
+-                                virtual_backend["cache_dir_vae"] = os.path.join(backend["cache_dir_vae"], virtual_id)
+-                            else:
+-                                virtual_backend["cache_dir_vae"] = os.path.join(self.args.cache_dir, "vae", virtual_id)
+-                            backend.setdefault("conditioning_data", []).append(virtual_id)
+-                            conditioning_datasets.append(virtual_backend)
++                            virtual_backend["cache_dir_vae"] = os.path.join(self.args.cache_dir, "vae", virtual_id)
++                        backend.setdefault("conditioning_data", []).append(virtual_id)
++                        conditioning_datasets.append(virtual_backend)
+ 
+             conditioning_block = backend.get("conditioning", None)
+             has_explicit_conditioning = conditioning_block not in (None, [], {})
+@@ -1474,7 +1476,7 @@ class FactoryRegistry:
+             init_backend = init_backend_config(backend, self.args, self.accelerator)
+             StateTracker.set_data_backend_config(init_backend["id"], init_backend["config"])
+ 
+-            if backend["type"] == "local":
++            if backend["type"] in {"local", "in_memory"}:
+                 text_embed_cache_dir_paths.append(backend.get("cache_dir", self.args.cache_dir_text))
+                 config = create_backend_config(backend, vars(self.args))
+                 builder = create_backend_builder(backend["type"], self.accelerator, self.args)
+@@ -1635,7 +1637,7 @@ class FactoryRegistry:
+                 raise ValueError(f"You can only have one backend named {init_backend['id']}")
+             StateTracker.set_data_backend_config(init_backend["id"], init_backend["config"])
+ 
+-            if backend["type"] == "local":
++            if backend["type"] in {"local", "in_memory"}:
+                 config = create_backend_config(backend, vars(self.args))
+                 builder = create_backend_builder(backend["type"], self.accelerator, self.args)
+                 init_backend["data_backend"] = builder.build(config)
+@@ -1696,7 +1698,7 @@ class FactoryRegistry:
+                 raise ValueError(f"You can only have one backend named {init_backend['id']}")
+             StateTracker.set_data_backend_config(init_backend["id"], init_backend["config"])
+ 
+-            if backend["type"] == "local":
++            if backend["type"] in {"local", "in_memory"}:
+                 config = create_backend_config(backend, vars(self.args))
+                 builder = create_backend_builder(backend["type"], self.accelerator, self.args)
+                 init_backend["data_backend"] = builder.build(config)
+@@ -1920,7 +1922,7 @@ class FactoryRegistry:
+ 
+         init_backend["data_backend"] = builder.build(config)
+ 
+-        if backend["type"] == "local":
++        if backend["type"] in {"local", "in_memory"}:
+             raw_instance_dir = backend.get("instance_data_dir", backend.get("instance_data_root"))
+             if raw_instance_dir is None:
+                 raise ValueError(
+@@ -2628,7 +2630,7 @@ class FactoryRegistry:
+                 f"VAE image embed cache directory {vae_cache_dir} is the same as the text embed cache directory. This is not allowed, the trainer will get confused."
+             )
+ 
+-        if backend["type"] == "local" and (vae_cache_dir is None or vae_cache_dir == ""):
++        if backend["type"] in {"local", "in_memory"} and (vae_cache_dir is None or vae_cache_dir == ""):
+             if (not self.args.controlnet or backend["dataset_type"] != "conditioning") or (
+                 self.model.requires_conditioning_latents() and self._requires_conditioning_dataset()
+             ):

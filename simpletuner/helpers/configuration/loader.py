@@ -90,6 +90,8 @@ def load_config(args: dict = None, exit_on_error: bool = False):
     if "-h" in sys.argv or "--help" in sys.argv:
         return helpers["cmd"]()
 
+    if isinstance(args, dict) and args:
+        StateTracker.set_raw_config(args)
     if args is not None and hasattr(args, "__dict__"):
         args = args.__dict__.copy()
         args.pop("should_abort", None)
