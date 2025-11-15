@@ -85,3 +85,6 @@ gh200_diagnostic_report.json
 PATCH_MANIFEST.md
 VERIFICATION_REPORT.txt
 patches/*.patch
+
+# Claude Code metadata
+/.claude/
